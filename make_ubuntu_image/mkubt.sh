@@ -2,47 +2,81 @@
 #Phoebe 2017.12.16
 
 
+UEFI=100M
 SIZE=2G
 #SWAP=128M
 #http://cdimage.ubuntu.com/ubuntu-base/releases/16.04/release/ubuntu-base-16.04-core-amd64.tar.gz
 RTFS=ubuntu-base-16.04-core-amd64.tar.gz
-#KERNEL=4.10.0-42
+KERNEL=4.10.0-42
 DRIVE=/dev/nbd0
 
-[[ -z $SWAP ]] && SWAP=0
-[[ "${SWAP:0-1:1}"x = "K"x ]] && SWAP=$((${SWAP:0:-1} * 1024))
-[[ "${SWAP:0-1:1}"x = "M"x ]] && SWAP=$((${SWAP:0:-1} * 1024 * 1024))
-[[ "${SWAP:0-1:1}"x = "G"x ]] && SWAP=$((${SWAP:0:-1} * 1024 * 1024 * 1024))
+function size_in_byte()
+{
+    BYTES=$1
+    [[ -z $BYTES ]] && BYTES=0
+    [[ "${BYTES:0-1:1}"x = "K"x ]] && BYTES=$((${BYTES:0:-1} * 1024))
+    [[ "${BYTES:0-1:1}"x = "M"x ]] && BYTES=$((${BYTES:0:-1} * 1024 * 1024))
+    [[ "${BYTES:0-1:1}"x = "G"x ]] && BYTES=$((${BYTES:0:-1} * 1024 * 1024 * 1024))
+    echo $BYTES
+}
 
+
+UEFI=`size_in_byte $UEFI`
+SWAP=`size_in_byte $SWAP`
 
 qemu-img create -f qcow2 ./core-ubuntu.img $SIZE
 sudo modprobe nbd max_part=16
 sudo qemu-nbd -c $DRIVE core-ubuntu.img
 SIZE=`sudo fdisk -l $DRIVE | grep Disk | awk '{print $7}'`
-ROOT=`echo $SIZE - $SWAP /512 | bc`
+ROOT=`echo $SIZE - $(($SWAP + $UEFI)) /512 | bc`
 DELTA=33
 SWAP_PT=
-[[ $SWAP -gt 0 ]] && SWAP_PT=": type=82" && DELTA=0
+UEFI_PT=
+BOOT_PT=", bootable"
+DISK_LABEL=dos
+[[ $SWAP -gt 0 ]] && SWAP_PT=": type=0657FD6D-A4AB-43C4-84E5-0933C84B4F4F" && DELTA=0
+[[ ! -z $UEFI ]] && UEFI_PT=": size=$(($UEFI / 512)), type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, bootable" && BOOT_PT=
+DISK_LABEL=gpt
 sudo sfdisk $DRIVE -f << EOF
-label: dos
+label: $DISK_LABEL
 unit: sectors
 first-lba: 2048
 
-: size=$(($ROOT - 2048 - $DELTA)), bootable
+$UEFI_PT
+: size=$(($ROOT - 2048 - $DELTA))$BOOT_PT
 $SWAP_PT
 EOF
+if [[ ! -z $UEFI ]]; then
+sudo mkfs.vfat -F32 $DRIVE"p1"
+sudo mkfs.ext4 $DRIVE"p2"
+[[ $SWAP -gt 0 ]] && sudo mkswap $DRIVE"p3"
+sudo mount $DRIVE"p2" /mnt
+sudo mkdir -p /mnt/boot/efi
+sudo mount $DRIVE"p1" /mnt/boot/efi
+sudo mkdir -p /mnt/boot/efi/EFI/BOOT
+sudo grub-mkimage -o /mnt/boot/efi/EFI/BOOT/bootx64.efi -O x86_64-efi -p /EFI/BOOT search search_fs_file configfile help iso9660 fat part_gpt part_msdos disk exfat ext2 ntfs appleldr hfs normal reiserfs font linux chain
+#sudo grub-install $DRIVE
+else
 sudo mkfs.ext4 $DRIVE"p1"
 [[ $SWAP -gt 0 ]] && sudo mkswap $DRIVE"p2"
-
-
 sudo mount $DRIVE"p1" /mnt
+fi
 sudo tar -xpf $RTFS -C /mnt
 
 
 UUID1=`sudo blkid /dev/nbd0p1 | awk '{print $2}' | cut -f 2 -d "\""`
 UUID2=`sudo blkid /dev/nbd0p2 | awk '{print $2}' | cut -f 2 -d "\""`
-UUID2_STR=
-[[ ! -z $UUID2 ]] && UUID2_STR="UUID=$UUID2 none            swap    sw              0       0"
+UUID3=`sudo blkid /dev/nbd0p3 | awk '{print $2}' | cut -f 2 -d "\""`
+[[ -z $UEFI ]] && UUID3=$UUID2 && UUID2=$UUID1 && UUID1=
+UUID1_STR=
+[[ ! -z $UUID1 ]] && UUID1_STR="UUID=$UUID1 /boot/efi       vfat    umask=0077      0       1" &&
+cat << EOF | sudo tee /mnt/boot/efi/EFI/BOOT/grub.cfg
+search.fs_uuid $UUID2 root hd0,gpt2
+set prefix=(\$root)'/boot/grub'
+configfile \$prefix/grub.cfg
+EOF
+UUID3_STR=
+[[ ! -z $UUID3 ]] && UUID3_STR="UUID=$UUID3 none            swap    sw              0       0"
 cat << EOF | sudo tee /mnt/etc/fstab
 # /etc/fstab: static file system information.
 #
@@ -51,8 +85,9 @@ cat << EOF | sudo tee /mnt/etc/fstab
 # that works even if disks are added and removed. See fstab(5).
 #
 # <file system> <mount point>   <type>  <options>       <dump>  <pass>
-UUID=$UUID1 /               ext4    errors=remount-ro 0       1
-$UUID2_STR
+UUID=$UUID2 /               ext4    errors=remount-ro 0       1
+$UUID1_STR
+$UUID3_STR
 EOF
 
 
@@ -89,8 +124,15 @@ if [ ! -z $KERNEL ]; then
 INSTALL_CMD=`cat << EOF
 apt update
 apt install -y net-tools ethtool ifupdown
-apt install -y linux-headers-$KERNEL-generic
+#apt install -y linux-headers-$KERNEL-generic
 apt install -y linux-image-$KERNEL-generic
+apt install -y grub-efi-amd64
+grub-install --target=x86_64-efi $DRIVE
+sed -i 's/GRUB_TIMEOUT=10/GRUB_TIMEOUT=1/' /etc/default/grub
+sed -i 's/GRUB_HIDDEN_TIMEOUT=0/#GRUB_HIDDEN_TIMEOUT=0/' /etc/default/grub
+sed -i 's/GRUB_CMDLINE_LINUX=""/GRUB_CMDLINE_LINUX="console=ttyS0,115200"/' /etc/default/grub
+update-grub
+sed -i 's/nbd0p/sda/' /boot/grub/grub.cfg
 EOF
 `
 fi
@@ -110,9 +152,10 @@ sudo umount /mnt/proc
 sudo umount /mnt/sys
 sudo umount /mnt/dev
 
-if [ ! -z $KERNEL ]; then
-sudo sed -i 's/GRUB_TIMEOUT=10/GRUB_TIMEOUT=0/' /mnt/etc/default/grub
-sudo sed -i 's/GRUB_CMDLINE_LINUX=""/GRUB_CMDLINE_LINUX="console=ttyS0,115200 earlyprintk=serial"/' /mnt/etc/default/grub
-fi
+if [[ ! -z $UEFI ]]; then
 sudo umount $DRIVE"p1"
+sudo umount $DRIVE"p2"
+else
+sudo umount $DRIVE"p1"
+fi
 sudo qemu-nbd -d $DRIVE
